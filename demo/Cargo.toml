@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 drc = { version = "0.1.0", path = "../drc" }
+snafu = "0.8.9"
+tokio = "1.48.0"
