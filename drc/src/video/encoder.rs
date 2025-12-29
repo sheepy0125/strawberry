@@ -82,11 +82,11 @@ impl Encoder {
         Ok(Self { encoder })
     }
 
-    pub fn encode(&mut self, image: Image) -> Result<([&[u8]; 5], bool), Error> {
+    pub fn encode(&mut self, image: Image, resync: bool) -> Result<([&[u8]; 5], bool), Error> {
         let mut context: Context = Context::default();
         unsafe {
             self.encoder
-                .encode_drh(image, (&raw mut context).cast())
+                .encode_drh(image, resync, (&raw mut context).cast())
                 .map_err(|_| Error::Encoder)?;
         }
         let chunks: [(*const u8, usize); 5] = context.chunk_array.try_into().map_err(|v: ChunkArray| Error::ChunkCount {length: v.len()})?;

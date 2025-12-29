@@ -1,11 +1,11 @@
+use drc::Streamer;
 use ffmpeg_next::codec::Context;
-use ffmpeg_next::{decoder, format, frame};
 use ffmpeg_next::ffi::EAGAIN;
-use ffmpeg_next::format::{context, input};
+use ffmpeg_next::format::input;
 use ffmpeg_next::media::Type;
-use snafu::{OptionExt, Whatever};
+use ffmpeg_next::{format, frame};
 use snafu::ResultExt;
-use drc::Encoder;
+use snafu::OptionExt;
 use x264::{Colorspace, Plane};
 
 struct YuvFrame<'a> {
@@ -39,14 +39,14 @@ impl YuvFrame<'_> {
 #[tokio::main]
 async fn main() -> Result<(), snafu::Whatever>{
     ffmpeg_next::init().whatever_context("init ffmpeg")?;
-    let mut input: context::Input = input("/home/ruben/rick.mkv").whatever_context("load video")?;
+    let mut input = input("/home/ruben/rick.mkv").whatever_context("load video")?;
     let input_video = input.streams()
         .best(Type::Video)
         .whatever_context("No video stream")?;
     let video_idx = input_video.index();
-    let decoder_ctx: Context = Context::from_parameters(input_video.parameters()).whatever_context("making decoder ctx")?;
-    let mut decoder: decoder::Video = decoder_ctx.decoder().video().whatever_context("video decoder")?;
-    let mut encoder: Encoder = Encoder::new().whatever_context("creating encoder")?;
+    let decoder_ctx = Context::from_parameters(input_video.parameters()).whatever_context("making decoder ctx")?;
+    let mut decoder = decoder_ctx.decoder().video().whatever_context("video decoder")?;
+    let mut streamer = Streamer::new().await.whatever_context("gamepad streamer")?;
 
     let mut frame = frame::Video::empty();
     for (stream, packet) in input.packets() {
@@ -59,8 +59,7 @@ async fn main() -> Result<(), snafu::Whatever>{
                 Ok(()) => {
                     let frame = YuvFrame::new(&frame);
                     let image = frame.image();
-                    let (packets, idr) = encoder.encode(image).whatever_context("encoding")?;
-                    println!("{:?}", packets);
+                    streamer.push_frame(image).await.whatever_context("streaming")?;
                 }
                 Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => { break },
                 Err(e) => {

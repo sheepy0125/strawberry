@@ -1,3 +1,4 @@
+use std::io::Write;
 use crate::video::data::Error::{ExtHeaderLength, ExtHeaderValue};
 use bitfld::layout;
 use snafu::{OptionExt, ResultExt, Snafu, Whatever, ensure};
@@ -6,7 +7,7 @@ use zerocopy_derive::IntoBytes;
 
 layout!({
     #[derive(IntoBytes, FromBytes)]
-    pub struct VstrmHeader(u64);
+    pub struct BadVstrmHeader(u64);
     {
         let magic: Bits<63, 60>;
         let packet_type: Bits<59, 58>;
@@ -20,6 +21,62 @@ layout!({
     }
 });
 
+#[derive(Debug, Clone)]
+pub struct VstrmHeader {
+    pub magic: u8,
+    pub packet_type: u8,
+    pub seq_id: u16,
+    pub init: bool,
+    pub frame_begin: bool,
+    pub chunk_end: bool,
+    pub frame_end: bool,
+    pub has_timestamp: bool,
+    pub payload_size: u16,
+    pub timestamp: u32,
+    pub ext_headers: Vec<ExtOption>,
+}
+
+impl VstrmHeader {
+    pub const SIZE: usize = 16;
+
+    pub fn into_bytes(self) -> Result<[u8; Self::SIZE], Error> {
+        let mut buffer = [0u8; 16];
+        buffer[0] = self.magic << 4;
+        buffer[0] |= (self.packet_type << 2) & 0b1100;
+        buffer[0] |= (self.seq_id >> 8) as u8 & 0b11;  // 4 bit magic (F), 2 bit packet type (0), 2 bit seqid (0)
+        buffer[1] = self.seq_id as u8;
+        buffer[2] = (self.init as u8) << 7;
+        buffer[2] |= (self.frame_begin as u8) << 6;
+        buffer[2] |= (self.chunk_end as u8) << 5;
+        buffer[2] |= (self.frame_end as u8) << 4;
+        buffer[2] |= (self.has_timestamp as u8) << 3;
+        let payload_size = self.payload_size.to_be_bytes();
+        buffer[2] |= (payload_size[0]) & 0b111;
+        buffer[3] = payload_size[1];
+        buffer[4..8].copy_from_slice(&self.timestamp.to_be_bytes());
+        buffer[8..].copy_from_slice(&ExtOption::encode(&self.ext_headers)?);
+        Ok(buffer)
+    }
+}
+
+impl Default for VstrmHeader {
+    fn default() -> Self {
+        Self {
+            magic: 0xF,
+            packet_type: 0,
+            seq_id: 0,
+            init: false,
+            frame_begin: false,
+            chunk_end: false,
+            frame_end: false,
+            has_timestamp: true,
+            payload_size: 0,
+            timestamp: 0,
+            ext_headers: vec![ExtOption::ForceDecoding, ExtOption::NumMbRowsInChunk(6)],
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug, Copy, Clone)]
 pub enum ExtOption {
@@ -32,7 +89,7 @@ pub enum ExtOption {
 }
 
 impl ExtOption {
-    pub fn encode(options: &[ExtOption]) -> Result<Vec<u8>, Error> {
+    pub fn encode(options: &[ExtOption]) -> Result<[u8; 8], Error> {
         let mut result = vec![];
         for opt in options {
             match opt {
@@ -51,7 +108,7 @@ impl ExtOption {
             }
         );
         result.resize(8, 0);
-        Ok(result)
+        Ok(result.try_into().unwrap())
     }
 
     pub fn decode(value: &[u8]) -> Result<Vec<Self>, Error> {
