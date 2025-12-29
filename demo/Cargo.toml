@@ -8,3 +8,4 @@ drc = { version = "0.1.0", path = "../drc" }
 ffmpeg-next = "8.0.0"
 snafu = "0.8.9"
 tokio = "1.48.0"
+x264 = { version = "0.5.0", path = "../x264" }

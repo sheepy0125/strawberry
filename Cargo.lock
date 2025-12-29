@@ -135,6 +135,7 @@ dependencies = [
  "ffmpeg-next",
  "snafu",
  "tokio",
+ "x264",
 ]
 
 [[package]]
