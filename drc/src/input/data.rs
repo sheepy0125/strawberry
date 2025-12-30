@@ -1,15 +1,16 @@
 use bitfld::layout;
 use bitflags::bitflags;
+use zerocopy::{big_endian, little_endian};
 use zerocopy_derive::{FromBytes, FromZeros};
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, FromBytes)]
 pub struct InputData {
-    pub seq_id: u16,
+    pub seq_id: big_endian::U16,
     pub buttons: Buttons,
     pub power_status: PowerStatus,
     pub battery_charge: u8,
-    pub left_stick_x: u16,
+    pub left_stick_x: little_endian::U16,
     pub left_stick_y: u16,
     pub right_stick_x: u16,
     pub right_stick_y: u16,
@@ -80,9 +81,9 @@ bitflags! {
 #[repr(C)]
 #[derive(Debug, Copy, Clone, FromBytes)]
 pub struct Accelerometer {
-    pub x_accel: i16,
-    pub y_accel: i16,
-    pub z_accel: i16,
+    pub z_accel: little_endian::I16,
+    pub x_accel: little_endian::I16,
+    pub y_accel: little_endian::I16,
 }
 
 #[repr(C)]

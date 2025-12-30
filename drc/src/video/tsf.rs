@@ -1,8 +1,8 @@
 use std::fs::File;
 use std::io::Read;
 
-pub fn timestamp() -> u32 {
-    tsf() as u32
+pub fn timestamp() -> u64 {
+    tsf()
 }
 
 fn tsf() -> u64 {

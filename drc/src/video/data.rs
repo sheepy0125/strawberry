@@ -171,6 +171,17 @@ pub enum FrameRate {
     TwentyFive = 3,
 }
 
+impl FrameRate {
+    pub const fn freq(self) -> f32 {
+        match self {
+            FrameRate::Sixty => 59.94,
+            FrameRate::Fifty => 50.0,
+            FrameRate::Thirty => 29.97,
+            FrameRate::TwentyFive => 25.0,
+        }
+    }
+}
+
 impl TryFrom<u8> for FrameRate {
     type Error = Error;
 
