@@ -1,0 +1,11 @@
+[package]
+name = "libdrc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ffmpeg-next = "8.0.0"
+snafu = "0.8.9"
+
+[build-dependencies]
+bindgen = "0.72.1"
