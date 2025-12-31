@@ -1,26 +1,50 @@
 mod data;
 mod encoder;
 mod tsf;
+pub mod frame;
 
 use crate::video::data::{ExtOption, FrameRate, VstrmHeader};
 pub use data::Error as DataError;
 pub use encoder::{Encoder, Error as EncoderError};
-use snafu::{ResultExt, Snafu};
+use snafu::{Report, ResultExt, Snafu};
 use std::fs::File;
 use std::io::Write;
+use std::process::Termination;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
+use tokio::task::LocalSet;
 use tokio::time::Instant;
 use x264::Image;
+use crate::frame::Frame;
 
 const MAX_PAYLOAD_SIZE: usize = 1400;
 
 pub struct Streamer {
+    send: watch::Sender<Option<Box<dyn Frame + Send + Sync>>>
+}
+
+impl Streamer {
+    pub async fn new() -> Result<Self, Error> {
+        let (send, recv) = watch::channel(None);
+        VideoRunner::spawn(recv);
+        Ok(Self {
+            send
+        })
+    }
+
+    pub fn push_frame(&self, frame: Box<dyn Frame + Send + Sync>) -> Result<(), Error> {
+        self.send.send(Some(frame)).map_err(|_| Error::Queue)?;
+        Ok(())
+    }
+}
+
+struct VideoRunner {
+    recv: watch::Receiver<Option<Box<dyn Frame + Send + Sync>>>,
     initial: bool,
-    a_seq_id: u16,
     v_seq_id: u16,
     encoder: Encoder,
     v_connection: UdpSocket,
@@ -28,7 +52,6 @@ pub struct Streamer {
     next_send: Instant,
     next_timestamp: u64,
     resync: Arc<AtomicBool>,
-    debug_file: Option<File>,
 }
 
 fn dump_headers(mut file: impl Write) {
@@ -95,8 +118,20 @@ async fn msg_handler(resync: Arc<AtomicBool>) {
     }
 }
 
-impl Streamer {
-    pub async fn new() -> Result<Self, Error> {
+impl VideoRunner {
+    fn spawn(recv: watch::Receiver<Option<Box<dyn Frame + Send + Sync>>>) {
+        tokio::task::spawn_local(async {
+            let result: Result<(), Error> = async {
+                let mut runner = Self::new(recv).await?;
+                loop {
+                    runner.update_frame().await?;
+                }
+            }.await;
+            Report::from(result).report();
+        });
+    }
+
+    async fn new(recv: watch::Receiver<Option<Box<dyn Frame + Send + Sync>>>) -> Result<Self, Error> {
         let v_connection =
             UdpSocket::bind("192.168.1.10:50020")
                 .await
@@ -125,21 +160,19 @@ impl Streamer {
         eprintln!("opened audio port");
         let encoder = Encoder::new().context(EncoderCreateSnafu)?;
         eprintln!("started encoder");
-        // let mut debug_file = File::create("./debug.data").unwrap();
-        // dump_headers(&mut debug_file);
+
         let resync = Arc::new(AtomicBool::new(true));
         tokio::spawn(msg_handler(resync.clone()));
         Ok(Self {
+            recv,
             initial: true,
             v_seq_id: 0,
-            a_seq_id: 0,
             encoder,
             v_connection,
             a_connection,
             next_send: Instant::now(),
             next_timestamp: tsf::timestamp(),
             resync,
-            debug_file: None,
         })
     }
 
@@ -164,17 +197,20 @@ impl Streamer {
         Ok(())
     }
 
-    pub async fn push_frame(&mut self, image: Image<'_>) -> Result<(), Error> {
-        const FRAMERATE: FrameRate = FrameRate::TwentyFive;
+    async fn update_frame(&mut self) -> Result<(), Error> {
+        const FRAMERATE: FrameRate = FrameRate::Sixty;
 
+        let image = self.recv.borrow_and_update();
+        let Some(im) = &*image else {
+            return Ok(())
+        };
         let resync = self
             .resync
             .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok();
-        let (chunks, idr) = self.encoder.encode(image, resync).context(EncodingSnafu)?;
-        if let Some(file) = &mut self.debug_file {
-            dump_frame(file, &chunks, idr);
-        }
+        let (chunks, idr) = self.encoder.encode(im.as_image(), resync).context(EncodingSnafu)?;
+        drop(image);
+
         let timestamp = tsf::timestamp();
 
         let init_flag = self.initial;
@@ -235,13 +271,9 @@ impl Streamer {
         }
 
         let now_timestamp = tsf::timestamp();
-        let overflown;
-        (self.next_timestamp, overflown) = self.next_timestamp.overflowing_add((1000000.0 / FRAMERATE.freq()) as u64);
-        if !overflown && self.next_timestamp < now_timestamp {
-            eprintln!("too slow");
-            self.next_timestamp = now_timestamp + 1000;
-        }
-        self.next_send = Instant::now() + Duration::from_micros(self.next_timestamp - now_timestamp);
+        self.next_timestamp = self.next_timestamp + (1000000.0 / FRAMERATE.freq()) as u64;
+        let delta = i64::max(self.next_timestamp as i64 - now_timestamp as i64, 1000);
+        self.next_send = Instant::now() + Duration::from_micros(delta as u64);
         Ok(())
     }
 }
@@ -264,6 +296,8 @@ pub enum Error {
         ty: ConnectionType,
         source: std::io::Error,
     },
+    /// TODO
+    Queue
 }
 
 #[derive(Debug)]
