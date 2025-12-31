@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
+use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::task::LocalSet;
 use tokio::time::Instant;
@@ -23,11 +24,11 @@ use crate::frame::Frame;
 
 const MAX_PAYLOAD_SIZE: usize = 1400;
 
-pub struct Streamer {
-    send: watch::Sender<Option<Box<dyn Frame + Send + Sync>>>
+pub struct Streamer<T: Frame + Send + Sync> {
+    send: watch::Sender<Option<T>>
 }
 
-impl Streamer {
+impl<T: Frame + Send + Sync + 'static> Streamer<T> {
     pub async fn new() -> Result<Self, Error> {
         let (send, recv) = watch::channel(None);
         VideoRunner::spawn(recv);
@@ -36,14 +37,14 @@ impl Streamer {
         })
     }
 
-    pub fn push_frame(&self, frame: Box<dyn Frame + Send + Sync>) -> Result<(), Error> {
+    pub fn push_frame(&self, frame: T) -> Result<(), Error> {
         self.send.send(Some(frame)).map_err(|_| Error::Queue)?;
         Ok(())
     }
 }
 
-struct VideoRunner {
-    recv: watch::Receiver<Option<Box<dyn Frame + Send + Sync>>>,
+struct VideoRunner<T: Frame + Send + Sync> {
+    recv: watch::Receiver<Option<T>>,
     initial: bool,
     v_seq_id: u16,
     encoder: Encoder,
@@ -118,20 +119,20 @@ async fn msg_handler(resync: Arc<AtomicBool>) {
     }
 }
 
-impl VideoRunner {
-    fn spawn(recv: watch::Receiver<Option<Box<dyn Frame + Send + Sync>>>) {
-        tokio::task::spawn_local(async {
-            let result: Result<(), Error> = async {
+impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
+    fn spawn(recv: watch::Receiver<Option<T>>) {
+        tokio::task::spawn_blocking(move || {
+            let result: Result<(), Error> = Handle::current().block_on(async {
                 let mut runner = Self::new(recv).await?;
                 loop {
                     runner.update_frame().await?;
                 }
-            }.await;
+            });
             Report::from(result).report();
         });
     }
 
-    async fn new(recv: watch::Receiver<Option<Box<dyn Frame + Send + Sync>>>) -> Result<Self, Error> {
+    async fn new(recv: watch::Receiver<Option<T>>) -> Result<Self, Error> {
         let v_connection =
             UdpSocket::bind("192.168.1.10:50020")
                 .await
@@ -217,7 +218,7 @@ impl VideoRunner {
         self.initial = false;
         let mut packets = Vec::new();
         for (i, mut chunk) in chunks.into_iter().enumerate() {
-            assert!(chunk.len() > 0, "empty chunks are possible?");
+            debug_assert!(chunk.len() > 0, "empty chunks are possible?");
             let mut first_packet = true;
             let first_chunk = i == 0;
             let last_chunk = i == chunks.len() - 1;
@@ -260,6 +261,10 @@ impl VideoRunner {
             }
         }
 
+        let elapsed = self.next_send.elapsed();
+        if !elapsed.is_zero() {
+            println!("missed deadline by {elapsed:?}");
+        }
         tokio::time::sleep_until(self.next_send).await;
         Self::send_video_format(&self.a_connection, timestamp as u32).await?;
         // println!("{} packets", packets.len());
@@ -272,7 +277,13 @@ impl VideoRunner {
 
         let now_timestamp = tsf::timestamp();
         self.next_timestamp = self.next_timestamp + (1000000.0 / FRAMERATE.freq()) as u64;
-        let delta = i64::max(self.next_timestamp as i64 - now_timestamp as i64, 1000);
+        let mut delta = self.next_timestamp as i64 - now_timestamp as i64;
+        if delta <= 0 {
+            println!("behind {delta}us");
+        }
+        if delta < 1000 {
+            delta = 1000;
+        }
         self.next_send = Instant::now() + Duration::from_micros(delta as u64);
         Ok(())
     }

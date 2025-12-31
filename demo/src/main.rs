@@ -57,49 +57,47 @@ async fn uvc_handler() -> Result<(), snafu::Whatever> {
 #[snafu::report]
 #[tokio::main]
 async fn main() -> Result<(), snafu::Whatever> {
-    LocalSet::new().run_until(async {
-        tokio::spawn(async move { uvc_handler().await.report() });
+    tokio::spawn(async move { uvc_handler().await.report() });
 
-        ffmpeg_next::init().whatever_context("init ffmpeg")?;
-        let mut input = input("/home/ruben/rick.mkv").whatever_context("load video")?;
-        let input_video = input
-            .streams()
-            .best(Type::Video)
-            .whatever_context("No video stream")?;
-        let video_idx = input_video.index();
-        let decoder_ctx = Context::from_parameters(input_video.parameters())
-            .whatever_context("making video decoder ctx")?;
-        // let input_audio = input.streams().best(Type::Audio)
-        //     .whatever_context("No audio stream")?;
-        // let audio_idx = input_audio.index();
-        let mut decoder = decoder_ctx
-            .decoder()
-            .video()
-            .whatever_context("video decoder")?;
-        let streamer = Streamer::new().await.whatever_context("gamepad streamer")?;
+    ffmpeg_next::init().whatever_context("init ffmpeg")?;
+    let mut input = input("/home/ruben/rick.mkv").whatever_context("load video")?;
+    let input_video = input
+        .streams()
+        .best(Type::Video)
+        .whatever_context("No video stream")?;
+    let video_idx = input_video.index();
+    let decoder_ctx = Context::from_parameters(input_video.parameters())
+        .whatever_context("making video decoder ctx")?;
+    // let input_audio = input.streams().best(Type::Audio)
+    //     .whatever_context("No audio stream")?;
+    // let audio_idx = input_audio.index();
+    let mut decoder = decoder_ctx
+        .decoder()
+        .video()
+        .whatever_context("video decoder")?;
+    let streamer = Streamer::new().await.whatever_context("gamepad streamer")?;
 
-        for (stream, packet) in input.packets() {
-            if stream.index() != video_idx {
-                continue;
-            }
-            decoder.send_packet(&packet).whatever_context("decoding")?;
-            loop {
-                let mut frame = frame::Video::empty();
-                match decoder.receive_frame(&mut frame) {
-                    Ok(()) => {
-                        streamer
-                            .push_frame(Box::new(MyFrame(frame)))
-                            .whatever_context("streaming")?;
-                        tokio::time::sleep(Duration::from_millis(1000 / 25)).await;
-                    }
-                    Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => break,
-                    Err(e) => {
-                        return Err(e).whatever_context("uh oh");
-                    }
+    for (stream, packet) in input.packets() {
+        if stream.index() != video_idx {
+            continue;
+        }
+        decoder.send_packet(&packet).whatever_context("decoding")?;
+        loop {
+            let mut frame = frame::Video::empty();
+            match decoder.receive_frame(&mut frame) {
+                Ok(()) => {
+                    streamer
+                        .push_frame(MyFrame(frame))
+                        .whatever_context("streaming")?;
+                    tokio::time::sleep(Duration::from_millis(1000 / 25)).await;
+                }
+                Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => break,
+                Err(e) => {
+                    return Err(e).whatever_context("uh oh");
                 }
             }
         }
+    }
 
-        Ok(())
-    }).await
+    Ok(())
 }
