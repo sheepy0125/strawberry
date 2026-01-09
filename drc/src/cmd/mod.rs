@@ -1,15 +1,17 @@
-use crate::cmd::data::{Command, CommandHeader, CommandPacket};
-use snafu::{Report, ResultExt, Snafu, ensure};
+use crate::cmd::data::{CommandHeader, CommandPacket, Payload};
+use crate::cmd::generic::GenericPayload;
+use snafu::{ensure, Report, ResultExt, Snafu};
 use std::process::Termination;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::select;
 use tokio::sync::broadcast;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, transmute_mut};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub mod data;
+pub mod generic;
 
 pub struct CommandHandler {
     seq_id: AtomicU16,
@@ -18,6 +20,9 @@ pub struct CommandHandler {
 }
 
 impl CommandHandler {
+    const TIMEOUT: Duration = Duration::from_millis(1000);
+    const RETRIES: usize = 10;
+
     pub async fn new() -> Result<Self, Error> {
         let socket = UdpSocket::bind("192.168.1.10:50023")
             .await
@@ -60,29 +65,26 @@ impl CommandHandler {
         self.seq_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn send_packet<T: IntoBytes + Immutable + KnownLayout>(
+    async fn send_packet<T: Payload>(
         &self,
-        packet_type: u16,
-        query_type: u16,
         seq_id: u16,
-        payload: T,
+        payload: &T,
     ) -> Result<(), std::io::Error> {
-        let mut buffer = vec![0u8; size_of::<CommandHeader>() + size_of::<T>()];
-        let command: &mut CommandPacket =
-            CommandPacket::mut_from_bytes(&mut buffer).expect("no bytes");
-        command.header = CommandHeader {
-            packet_type: packet_type.into(),
-            query_type: query_type.into(),
-            payload_size: (size_of::<T>() as u16).into(),
-            seq_id: seq_id.into(),
-        };
-        payload
-            .write_to(&mut command.payload)
-            .expect("payload size mismatch");
-
-        // println!("sending {:#?}", command.header);
+        let mut buffer = vec![0u8; payload.packet_size()];
+        payload.write_packet(seq_id, &mut buffer);
 
         self.socket.send(&buffer).await?;
+        Ok(())
+    }
+
+    async fn send_ack<T: Payload>(&self, seq_id: u16, payload: &T) -> Result<(), std::io::Error> {
+        let command = CommandHeader {
+            packet_type: 3.into(),
+            query_type: T::QUERY_TYPE.into(),
+            payload_size: 0.into(),
+            seq_id: seq_id.into()
+        };
+        self.socket.send(command.as_bytes()).await?;
         Ok(())
     }
 
@@ -96,9 +98,9 @@ impl CommandHandler {
             let packet = loop {
                 select! {
                     res = rcv.recv() => break res.unwrap(),
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    _ = tokio::time::sleep(Self::TIMEOUT) => {
                         retries += 1;
-                        if retries == 10 {
+                        if retries >= Self::RETRIES {
                             return Err(Error::Timeout)
                         }
                     },
@@ -111,8 +113,6 @@ impl CommandHandler {
             if packet_data.header.seq_id != seq_id {
                 continue;
             }
-
-            // println!("recv {:#?}", packet_data.header);
             ensure!(
                 packet_data.header.payload_size.get() as usize == packet_data.payload.len(),
                 PayloadLengthSnafu
@@ -121,11 +121,11 @@ impl CommandHandler {
         }
     }
 
-    pub async fn command<T: Command>(&self, data: T) -> Result<T::RecvPayload, Error> {
+    pub async fn command<T: Payload>(&self, data: &T) -> Result<T::Response, Error> {
         let seq_id = self.next_seq_id();
         let mut rcv = self.broadcast.subscribe();
 
-        self.send_packet(0, T::QUERY_TYPE, seq_id, data.payload())
+        self.send_packet(seq_id, data)
             .await
             .context(SendSnafu)?;
 
@@ -139,10 +139,10 @@ impl CommandHandler {
         let response = CommandPacket::ref_from_bytes(&response).expect("already unpacked");
 
         ensure!(response.header.packet_type == 2, ResponseExpectedSnafu);
-        self.send_packet(3, T::QUERY_TYPE, seq_id, ())
+        self.send_ack(seq_id, data)
             .await
             .context(SendSnafu)?;
-        T::RecvPayload::read_from_bytes(&response.payload).map_err(|x| Error::Incomplete {
+        T::Response::read_from_bytes(&response.payload).map_err(|x| Error::Incomplete {
             reason: x.to_string(),
         })
     }

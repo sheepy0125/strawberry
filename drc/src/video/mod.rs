@@ -1,9 +1,11 @@
 mod data;
 mod encoder;
-mod tsf;
 pub mod frame;
+mod tsf;
 
+use crate::frame::Frame;
 use crate::video::data::{ExtOption, FrameRate, VstrmHeader};
+use crate::video::tsf::Tsf;
 pub use data::Error as DataError;
 pub use encoder::{Encoder, Error as EncoderError};
 use snafu::{Report, ResultExt, Snafu};
@@ -12,29 +14,25 @@ use std::io::Write;
 use std::process::Termination;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
-use tokio::task::LocalSet;
-use tokio::time::Instant;
+use tokio::task::{JoinSet, LocalSet};
 use x264::Image;
-use crate::frame::Frame;
 
 const MAX_PAYLOAD_SIZE: usize = 1400;
 
 pub struct Streamer<T: Frame + Send + Sync> {
-    send: watch::Sender<Option<T>>
+    send: watch::Sender<Option<T>>,
 }
 
 impl<T: Frame + Send + Sync + 'static> Streamer<T> {
     pub async fn new() -> Result<Self, Error> {
         let (send, recv) = watch::channel(None);
         VideoRunner::spawn(recv);
-        Ok(Self {
-            send
-        })
+        Ok(Self { send })
     }
 
     pub fn push_frame(&self, frame: T) -> Result<(), Error> {
@@ -49,8 +47,8 @@ struct VideoRunner<T: Frame + Send + Sync> {
     v_seq_id: u16,
     encoder: Encoder,
     v_connection: UdpSocket,
-    a_connection: UdpSocket,
-    next_send: Instant,
+    a_connection: Arc<UdpSocket>,
+    tsf: Tsf,
     next_timestamp: u64,
     resync: Arc<AtomicBool>,
 }
@@ -111,7 +109,7 @@ async fn msg_handler(resync: Arc<AtomicBool>) {
         let mut buf = [0u8; 4];
         socket.recv(&mut buf).await.unwrap();
         if buf == [1, 0, 0, 0] {
-            // eprintln!("{:?} resync request", Instant::now());
+            eprintln!("resync");
             resync.store(true, Ordering::Relaxed);
         } else {
             eprintln!("unexpected {buf:?}");
@@ -122,10 +120,14 @@ async fn msg_handler(resync: Arc<AtomicBool>) {
 impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
     fn spawn(recv: watch::Receiver<Option<T>>) {
         tokio::task::spawn_blocking(move || {
-            let result: Result<(), Error> = Handle::current().block_on(async {
-                let mut runner = Self::new(recv).await?;
+            let result: Report<Error> = Report::capture(|| {
+                let mut runner = Handle::current().block_on(Self::new(recv))?;
+                // let mut last_loop = Instant::now();
+                tokio::spawn(audio_loop(runner.a_connection.clone()));
                 loop {
-                    runner.update_frame().await?;
+                    // println!("since last loop {:?}", last_loop.elapsed());
+                    // last_loop = Instant::now();
+                    runner.update_frame()?;
                 }
             });
             Report::from(result).report();
@@ -145,13 +147,14 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
             .context(ConnectingSnafu {
                 ty: ConnectionType::Video,
             })?;
+        // v_connection.set_tos(0x10).expect("set TOS"); // TODO: constant IPTOS_LOWDELAY
         eprintln!("opened video port");
         let a_connection =
-            UdpSocket::bind("192.168.1.10:50021")
+            Arc::new(UdpSocket::bind("192.168.1.10:50021")
                 .await
                 .context(ConnectingSnafu {
                     ty: ConnectionType::Audio,
-                })?;
+                })?);
         a_connection
             .connect("192.168.1.11:50121")
             .await
@@ -164,6 +167,8 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
 
         let resync = Arc::new(AtomicBool::new(true));
         tokio::spawn(msg_handler(resync.clone()));
+        let mut tsf = Tsf::new();
+        let next_timestamp = tsf.timestamp();
         Ok(Self {
             recv,
             initial: true,
@@ -171,13 +176,13 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
             encoder,
             v_connection,
             a_connection,
-            next_send: Instant::now(),
-            next_timestamp: tsf::timestamp(),
+            tsf,
+            next_timestamp,
             resync,
         })
     }
 
-    async fn send_video_format(conn: &UdpSocket, ts: u32) -> Result<(), Error> {
+    fn make_video_format(ts: u64) -> [u8; 32] {
         let mut packet = [0u8; 32];
         packet[0] = 0x04; // video fmt
         packet[2..4].copy_from_slice(&24u16.to_be_bytes());
@@ -190,32 +195,34 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
             0x80, 0x3e, 0x00, 0x00, //
             0x00, 0x00, 0x00, 0x00, //
         ]);
-        packet[8..12].copy_from_slice(&ts.to_le_bytes()); // TODO: why LE?
-        let ret = conn.send(&packet).await.context(SendSnafu {
+        packet[8..12].copy_from_slice(&(ts as u32).to_le_bytes()); // TODO: why LE?
+        packet
+    }
+
+    async fn send_video_format(conn: &UdpSocket, packet: &[u8; 32]) -> Result<(), Error> {
+        let ret = conn.send(packet).await.context(SendSnafu {
             ty: ConnectionType::Audio,
         })?;
         assert_eq!(ret, packet.len());
         Ok(())
     }
 
-    async fn update_frame(&mut self) -> Result<(), Error> {
-        const FRAMERATE: FrameRate = FrameRate::Sixty;
+    const FRAMERATE: FrameRate = FrameRate::Sixty;
 
+    fn prepare_packets(&mut self, timestamp: u64, resync: bool) -> Result<Vec<Vec<u8>>, Error> {
         let image = self.recv.borrow_and_update();
-        let Some(im) = &*image else {
-            return Ok(())
-        };
-        let resync = self
-            .resync
-            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok();
-        let (chunks, idr) = self.encoder.encode(im.as_image(), resync).context(EncodingSnafu)?;
-        drop(image);
-
-        let timestamp = tsf::timestamp();
+        let Some(im) = &*image else { return Ok(vec![]) };
 
         let init_flag = self.initial;
         self.initial = false;
+
+        let (chunks, idr) = self
+            .encoder
+            .encode(im.as_image(), resync || init_flag)
+            .context(EncodingSnafu)?;
+        debug_assert!(if resync || init_flag { idr } else { true });
+        drop(image);
+
         let mut packets = Vec::new();
         for (i, mut chunk) in chunks.into_iter().enumerate() {
             debug_assert!(chunk.len() > 0, "empty chunks are possible?");
@@ -248,7 +255,7 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
                 };
                 header
                     .ext_headers
-                    .push(ExtOption::FrameRate(FRAMERATE));
+                    .push(ExtOption::FrameRate(Self::FRAMERATE));
                 if idr {
                     header.ext_headers.push(ExtOption::Idr);
                 }
@@ -260,32 +267,74 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
                 packets.push(buffer);
             }
         }
+        Ok(packets)
+    }
 
-        let elapsed = self.next_send.elapsed();
-        if !elapsed.is_zero() {
-            println!("missed deadline by {elapsed:?}");
-        }
-        tokio::time::sleep_until(self.next_send).await;
-        Self::send_video_format(&self.a_connection, timestamp as u32).await?;
-        // println!("{} packets", packets.len());
+    async fn send_packets(
+        &mut self,
+        format_packet: &[u8; 32],
+        packets: &[Vec<u8>],
+    ) -> Result<(), Error> {
+        Self::send_video_format(&self.a_connection, &format_packet).await?;
         for packet in packets {
             let ret = self.v_connection.send(&packet).await.context(SendSnafu {
                 ty: ConnectionType::Video,
             })?;
             assert_eq!(ret, packet.len());
         }
-
-        let now_timestamp = tsf::timestamp();
-        self.next_timestamp = self.next_timestamp + (1000000.0 / FRAMERATE.freq()) as u64;
-        let mut delta = self.next_timestamp as i64 - now_timestamp as i64;
-        if delta <= 0 {
-            println!("behind {delta}us");
-        }
-        if delta < 1000 {
-            delta = 1000;
-        }
-        self.next_send = Instant::now() + Duration::from_micros(delta as u64);
         Ok(())
+    }
+
+    fn update_frame(&mut self) -> Result<(), Error> {
+        let resync = self.resync.load(Ordering::Relaxed);
+
+        let video = self.prepare_packets(self.next_timestamp, resync)?;
+        if video.is_empty() {
+            return Ok(());
+        }
+        let audio = Self::make_video_format(self.next_timestamp);
+
+        let current_timestamp = self.tsf.timestamp();
+        if self.next_timestamp > current_timestamp {
+            std::thread::sleep(Duration::from_micros(
+                self.next_timestamp - current_timestamp,
+            ));
+        } else {
+            println!("taking millisec off ({current_timestamp} is past {} by {}us)", self.next_timestamp, current_timestamp - self.next_timestamp);
+            self.next_timestamp = current_timestamp + 1000;
+        }
+        self.next_timestamp += (1000000.0 / Self::FRAMERATE.freq()) as u64;
+        Handle::current().block_on(self.send_packets(&audio, video.as_slice()))?;
+
+        if resync {
+            self.resync.store(false, Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+}
+
+const SAMPLES_PER_PACKET: usize = 384;
+const PACKET_INTERVAL: Duration = Duration::from_millis(8);
+async fn audio_loop(connection: Arc<UdpSocket>) {
+    let mut next_time = tokio::time::Instant::now();
+    let mut tsf = Tsf::new();
+    let mut packet = vec![0u8; 8 + SAMPLES_PER_PACKET * size_of::<i16>() * 2];
+    let mut seq_id = 0u16;
+    packet[0] = 1 << 5;
+    packet[2..4].copy_from_slice(&((SAMPLES_PER_PACKET * size_of::<i16>() * 2) as u16).to_be_bytes());
+    loop {
+        packet[0] = (packet[0] & 0b11111100) | ((seq_id >> 8) as u8 & 0b11);
+        packet[1] = seq_id as u8;
+        seq_id = (seq_id + 1) % 1024;
+        let ts = tsf.timestamp();
+        packet[4..8].copy_from_slice(&(ts as u32).to_be_bytes());
+        connection.send(&packet).await.expect("uh oh");
+        next_time += PACKET_INTERVAL;
+        if !next_time.elapsed().is_zero() {
+            eprintln!("audio behind deadline");
+        }
+        tokio::time::sleep_until(next_time).await;
     }
 }
 
@@ -308,7 +357,7 @@ pub enum Error {
         source: std::io::Error,
     },
     /// TODO
-    Queue
+    Queue,
 }
 
 #[derive(Debug)]

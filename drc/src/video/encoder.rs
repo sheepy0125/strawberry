@@ -18,7 +18,7 @@ impl Encoder {
     pub fn new() -> Result<Self, Error> {
         let mut builder = x264::Setup::preset(Preset::Slow, Tune::None, false, true);
         unsafe {
-            const ENABLE_INTRA_REFRESH: bool = false;
+            const ENABLE_INTRA_REFRESH: bool = true;
             let raw = builder.raw();
             raw.analyse.inter &= !X264_ANALYSE_PSUB16x16;
             if ENABLE_INTRA_REFRESH {
@@ -29,7 +29,7 @@ impl Encoder {
                 raw.i_keyint_max = X264_KEYINT_MAX_INFINITE as i32;
             }
             raw.i_scenecut_threshold = -1;
-            raw.i_csp = X264_CSP_I420 as i32;
+            // raw.i_csp = X264_CSP_I420 as i32;
             raw.b_cabac = 1;
             raw.b_interlaced = 0;
             raw.i_bframe = 0;

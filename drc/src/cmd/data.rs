@@ -12,6 +12,7 @@
 use std::fmt::Debug;
 use zerocopy::{big_endian, little_endian, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+use crate::cmd::generic::GenericCommandPacket;
 
 #[repr(C)]
 #[derive(Debug, FromBytes, IntoBytes, KnownLayout, Immutable)]
@@ -27,6 +28,29 @@ pub struct CommandHeader {
 pub struct CommandPacket {
     pub header: CommandHeader,
     pub payload: [u8]
+}
+
+pub trait Payload {
+    type Response: FromBytes + KnownLayout + Immutable;
+    const QUERY_TYPE: u16;
+
+    fn payload_size(&self) -> usize;
+    fn write_payload(&self, buffer: &mut [u8]);
+
+    fn packet_size(&self) -> usize {
+        size_of::<CommandHeader>() + self.payload_size()
+    }
+
+    fn write_packet(&self, seq_id: u16, buffer: &mut [u8]) {
+        let packet = CommandPacket::mut_from_bytes(buffer).expect("buffer size");
+        packet.header = CommandHeader {
+            packet_type: 0.into(),
+            query_type: Self::QUERY_TYPE.into(),
+            payload_size: (self.payload_size() as u16).into(),
+            seq_id: seq_id.into(),
+        };
+        self.write_payload(&mut packet.payload);
+    }
 }
 
 #[repr(C)]
@@ -60,6 +84,8 @@ pub struct UvcUacPayload { // TODO: verify endianness of camera stuff
     pub cam_white_balance: big_endian::U32,
     pub cam_multiplier: big_endian::U16,
     pub cam_multiplier_limit: big_endian::U16,
+    pub unknown4: u8,
+    pub unknown5: u8,
 }
 
 #[repr(C)]
@@ -105,23 +131,21 @@ impl Default for UvcUacPayload {
             cam_white_balance: Default::default(),
             cam_multiplier: Default::default(),
             cam_multiplier_limit: Default::default(),
+            unknown4: 0,
+            unknown5: 0,
         }
     }
 }
 
-pub trait Command {
-    type SendPayload: FromBytes + IntoBytes + KnownLayout + Immutable;
-    type RecvPayload: FromBytes + IntoBytes + KnownLayout + Immutable;
-    const QUERY_TYPE: u16;
-    fn payload(self) -> Self::SendPayload;
-}
-
-impl Command for UvcUacPayload {
-    type SendPayload = Self;
-    type RecvPayload = UvcUacResponse;
+impl Payload for UvcUacPayload {
+    type Response = UvcUacResponse;
     const QUERY_TYPE: u16 = 1;
 
-    fn payload(self) -> Self::SendPayload {
-        self
+    fn payload_size(&self) -> usize {
+        size_of::<Self>()
+    }
+
+    fn write_payload(&self, buffer: &mut [u8]) {
+        self.write_to(buffer).expect("buffer size");
     }
 }

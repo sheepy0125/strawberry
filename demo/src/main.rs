@@ -1,4 +1,7 @@
-use drc::{CommandHandler, Streamer, UvcUacPayload};
+use drc::cmd::data::UvcUacPayload;
+use drc::cmd::{generic, CommandHandler};
+use drc::frame::Frame;
+use drc::Streamer;
 use ffmpeg_next::codec::Context;
 use ffmpeg_next::ffi::EAGAIN;
 use ffmpeg_next::format::input;
@@ -7,10 +10,7 @@ use ffmpeg_next::{format, frame};
 use snafu::OptionExt;
 use snafu::{Report, ResultExt};
 use std::process::Termination;
-use std::thread;
 use std::time::Duration;
-use tokio::task::LocalSet;
-use drc::frame::Frame;
 use x264::{Colorspace, Image, Plane};
 
 struct MyFrame(frame::Video);
@@ -24,20 +24,19 @@ impl Frame for MyFrame {
                 stride: self.0.stride(i) as i32,
                 data: self.0.data(i),
             });
-        Image::new(Colorspace::I420, self.0.width() as i32, self.0.height() as i32, &planes)
+        unsafe {
+            Image::new_unchecked(Colorspace::I420.into(), self.0.width() as i32, self.0.height() as i32, &planes)
+        }
     }
 }
 
 #[snafu::report]
-async fn uvc_handler() -> Result<(), snafu::Whatever> {
-    let cmd_handler = CommandHandler::new()
-        .await
-        .whatever_context("command handler")?;
+async fn uvc_handler(cmd_handler: CommandHandler) -> Result<(), snafu::Whatever> {
     let mut state = UvcUacPayload::default();
     let result: Result<(), snafu::Whatever> = (async {
         loop {
             let resp = cmd_handler
-                .command(UvcUacPayload::default())
+                .command(&state)
                 .await
                 .whatever_context("send uvc uac")?;
 
@@ -54,10 +53,20 @@ async fn uvc_handler() -> Result<(), snafu::Whatever> {
     Ok(())
 }
 
+async fn launch_uvc() -> Result<(), snafu::Whatever> {
+    let cmd_handler = CommandHandler::new()
+        .await
+        .whatever_context("command handler")?;
+    let resp = cmd_handler.command(&generic::GetUicFirmware).await.whatever_context("get uic firmware")?;
+    eprintln!("{resp:?}");
+    tokio::spawn(async move { uvc_handler(cmd_handler).await.report() });
+    Ok(())
+}
+
 #[snafu::report]
 #[tokio::main]
 async fn main() -> Result<(), snafu::Whatever> {
-    tokio::spawn(async move { uvc_handler().await.report() });
+    launch_uvc().await?;
 
     ffmpeg_next::init().whatever_context("init ffmpeg")?;
     let mut input = input("/home/ruben/rick.mkv").whatever_context("load video")?;
