@@ -24,8 +24,12 @@ impl Frame for MyFrame {
                 stride: self.0.stride(i) as i32,
                 data: self.0.data(i),
             });
-        unsafe {
-            Image::new_unchecked(Colorspace::I420.into(), self.0.width() as i32, self.0.height() as i32, &planes)
+        if cfg!(debug_assertions) {
+            Image::new(Colorspace::I420, self.0.width() as i32, self.0.height() as i32, &planes)
+        } else {
+            unsafe {
+                Image::new_unchecked(Colorspace::I420.into(), self.0.width() as i32, self.0.height() as i32, &planes)
+            }
         }
     }
 }
@@ -75,34 +79,54 @@ async fn main() -> Result<(), snafu::Whatever> {
         .best(Type::Video)
         .whatever_context("No video stream")?;
     let video_idx = input_video.index();
-    let decoder_ctx = Context::from_parameters(input_video.parameters())
-        .whatever_context("making video decoder ctx")?;
-    // let input_audio = input.streams().best(Type::Audio)
-    //     .whatever_context("No audio stream")?;
-    // let audio_idx = input_audio.index();
-    let mut decoder = decoder_ctx
+    let video_ctx = Context::from_parameters(input_video.parameters())
+        .whatever_context("video ctx")?;
+    let input_audio = input.streams().best(Type::Audio)
+        .whatever_context("No audio stream")?;
+    let audio_idx = input_audio.index();
+    let mut video_decoder = video_ctx
         .decoder()
         .video()
         .whatever_context("video decoder")?;
+    let audio_ctx = Context::from_parameters(input_audio.parameters()).whatever_context("audio ctx")?;
+    let mut audio_decoder = audio_ctx.decoder().audio().whatever_context("audio decoder")?;
     let streamer = Streamer::new().await.whatever_context("gamepad streamer")?;
 
     for (stream, packet) in input.packets() {
-        if stream.index() != video_idx {
-            continue;
-        }
-        decoder.send_packet(&packet).whatever_context("decoding")?;
-        loop {
-            let mut frame = frame::Video::empty();
-            match decoder.receive_frame(&mut frame) {
-                Ok(()) => {
-                    streamer
-                        .push_frame(MyFrame(frame))
-                        .whatever_context("streaming")?;
-                    tokio::time::sleep(Duration::from_millis(1000 / 25)).await;
+        if stream.index() == video_idx {
+            video_decoder.send_packet(&packet).whatever_context("decoding video")?;
+            loop {
+                let mut frame = frame::Video::empty();
+                match video_decoder.receive_frame(&mut frame) {
+                    Ok(()) => {
+                        streamer
+                            .push_frame(MyFrame(frame))
+                            .whatever_context("streaming")?;
+                        tokio::time::sleep(Duration::from_millis(1000 / 25)).await;
+                    }
+                    Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => break,
+                    Err(e) => {
+                        return Err(e).whatever_context("uh oh");
+                    }
                 }
-                Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => break,
-                Err(e) => {
-                    return Err(e).whatever_context("uh oh");
+            }
+        } else if stream.index() == audio_idx {
+            audio_decoder.send_packet(&packet).whatever_context("decoding audio")?;
+            loop {
+                let mut frame = frame::Audio::empty();
+                match audio_decoder.receive_frame(&mut frame) {
+                    Ok(()) => {
+                        let data = frame.plane::<f32>(0).iter()
+                            .zip(frame.plane::<f32>(1))
+                            .flat_map(|(l, r)| [*l, *r])
+                            .map(|s| (s * (i16::MAX as f32)) as i16)
+                            .flat_map(|s| s.to_le_bytes());
+                        streamer.push_audio(data);
+                    }
+                    Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => break,
+                    Err(e) => {
+                        return Err(e).whatever_context("uh oh");
+                    }
                 }
             }
         }

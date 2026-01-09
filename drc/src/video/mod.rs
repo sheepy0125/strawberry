@@ -9,35 +9,40 @@ use crate::video::tsf::Tsf;
 pub use data::Error as DataError;
 pub use encoder::{Encoder, Error as EncoderError};
 use snafu::{Report, ResultExt, Snafu};
-use std::fs::File;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::process::Termination;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
-use tokio::task::{JoinSet, LocalSet};
-use x264::Image;
 
 const MAX_PAYLOAD_SIZE: usize = 1400;
 
 pub struct Streamer<T: Frame + Send + Sync> {
     send: watch::Sender<Option<T>>,
+    audio_queue: Arc<Mutex<VecDeque<u8>>>,
 }
 
 impl<T: Frame + Send + Sync + 'static> Streamer<T> {
     pub async fn new() -> Result<Self, Error> {
         let (send, recv) = watch::channel(None);
-        VideoRunner::spawn(recv);
-        Ok(Self { send })
+        let audio_queue = Default::default();
+        VideoRunner::spawn(recv, Arc::clone(&audio_queue));
+        Ok(Self { send, audio_queue })
     }
 
     pub fn push_frame(&self, frame: T) -> Result<(), Error> {
         self.send.send(Some(frame)).map_err(|_| Error::Queue)?;
         Ok(())
+    }
+
+    pub fn push_audio(&self, data: impl IntoIterator<Item = u8>) {
+        let mut guard = self.audio_queue.lock().unwrap();
+        guard.extend(data);
     }
 }
 
@@ -118,12 +123,12 @@ async fn msg_handler(resync: Arc<AtomicBool>) {
 }
 
 impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
-    fn spawn(recv: watch::Receiver<Option<T>>) {
+    fn spawn(recv: watch::Receiver<Option<T>>, audio_queue: Arc<Mutex<VecDeque<u8>>>) {
         tokio::task::spawn_blocking(move || {
             let result: Report<Error> = Report::capture(|| {
                 let mut runner = Handle::current().block_on(Self::new(recv))?;
                 // let mut last_loop = Instant::now();
-                tokio::spawn(audio_loop(runner.a_connection.clone()));
+                tokio::spawn(audio_loop(runner.a_connection.clone(), audio_queue));
                 loop {
                     // println!("since last loop {:?}", last_loop.elapsed());
                     // last_loop = Instant::now();
@@ -149,12 +154,11 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
             })?;
         // v_connection.set_tos(0x10).expect("set TOS"); // TODO: constant IPTOS_LOWDELAY
         eprintln!("opened video port");
-        let a_connection =
-            Arc::new(UdpSocket::bind("192.168.1.10:50021")
-                .await
-                .context(ConnectingSnafu {
-                    ty: ConnectionType::Audio,
-                })?);
+        let a_connection = Arc::new(UdpSocket::bind("192.168.1.10:50021").await.context(
+            ConnectingSnafu {
+                ty: ConnectionType::Audio,
+            },
+        )?);
         a_connection
             .connect("192.168.1.11:50121")
             .await
@@ -187,15 +191,16 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
         packet[0] = 0x04; // video fmt
         packet[2..4].copy_from_slice(&24u16.to_be_bytes());
         packet[4..8].copy_from_slice(&0x00100000u32.to_le_bytes()); // TODO: why LE?
-        packet[8..].copy_from_slice(&[
-            0x00, 0x00, 0x00, 0x00, //
-            0x80, 0x3e, 0x00, 0x00, //
-            0x80, 0x3e, 0x00, 0x00, //
-            0x80, 0x3e, 0x00, 0x00, //
-            0x80, 0x3e, 0x00, 0x00, //
-            0x00, 0x00, 0x00, 0x00, //
-        ]);
+        // Payload (24 bytes)
         packet[8..12].copy_from_slice(&(ts as u32).to_le_bytes()); // TODO: why LE?
+        packet[12..].copy_from_slice(&[
+            0x80, 0x3e, 0x00, 0x00, // mc_video[0]
+            0x80, 0x3e, 0x00, 0x00, // mc_video[1]
+            0x80, 0x3e, 0x00, 0x00, // mc_sync[0]
+            0x80, 0x3e, 0x00, 0x00, // mc_sync[1]
+            0x00, // vid_format
+            0x00, 0x00, 0x00, // padding
+        ]);
         packet
     }
 
@@ -299,9 +304,6 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
             std::thread::sleep(Duration::from_micros(
                 self.next_timestamp - current_timestamp,
             ));
-        } else {
-            println!("taking millisec off ({current_timestamp} is past {} by {}us)", self.next_timestamp, current_timestamp - self.next_timestamp);
-            self.next_timestamp = current_timestamp + 1000;
         }
         self.next_timestamp += (1000000.0 / Self::FRAMERATE.freq()) as u64;
         Handle::current().block_on(self.send_packets(&audio, video.as_slice()))?;
@@ -315,21 +317,33 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
 }
 
 const SAMPLES_PER_PACKET: usize = 384;
+const BYTES_PER_PACKET: usize = SAMPLES_PER_PACKET * 2 * size_of::<i16>();
 const PACKET_INTERVAL: Duration = Duration::from_millis(8);
-async fn audio_loop(connection: Arc<UdpSocket>) {
+async fn audio_loop(connection: Arc<UdpSocket>, audio_queue: Arc<Mutex<VecDeque<u8>>>) {
     let mut next_time = tokio::time::Instant::now();
     let mut tsf = Tsf::new();
-    let mut packet = vec![0u8; 8 + SAMPLES_PER_PACKET * size_of::<i16>() * 2];
+    let mut packet = vec![0u8; 8 + BYTES_PER_PACKET];
     let mut seq_id = 0u16;
     packet[0] = 1 << 5;
-    packet[2..4].copy_from_slice(&((SAMPLES_PER_PACKET * size_of::<i16>() * 2) as u16).to_be_bytes());
+    packet[2..4].copy_from_slice(&(BYTES_PER_PACKET as u16).to_be_bytes());
     loop {
         packet[0] = (packet[0] & 0b11111100) | ((seq_id >> 8) as u8 & 0b11);
         packet[1] = seq_id as u8;
         seq_id = (seq_id + 1) % 1024;
+        {
+            let mut audio = audio_queue.lock().unwrap();
+            let range = ..usize::min(BYTES_PER_PACKET, audio.len());
+            for (dst, src) in packet[8..]
+                .iter_mut()
+                .zip(audio.drain(range).chain(std::iter::repeat(0)))
+            {
+                *dst = src;
+            }
+        }
         let ts = tsf.timestamp();
-        packet[4..8].copy_from_slice(&(ts as u32).to_be_bytes());
+        packet[4..8].copy_from_slice(&(ts as u32).to_le_bytes());
         connection.send(&packet).await.expect("uh oh");
+
         next_time += PACKET_INTERVAL;
         if !next_time.elapsed().is_zero() {
             eprintln!("audio behind deadline");

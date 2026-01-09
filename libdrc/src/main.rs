@@ -26,45 +26,67 @@ fn main() -> Result<(), snafu::Whatever> {
         .best(Type::Video)
         .whatever_context("No video stream")?;
     let video_idx = input_video.index();
-    let decoder_ctx = Context::from_parameters(input_video.parameters())
-        .whatever_context("making video decoder ctx")?;
-    // let input_audio = input.streams().best(Type::Audio)
-    //     .whatever_context("No audio stream")?;
-    // let audio_idx = input_audio.index();
-    let mut decoder = decoder_ctx
+    let video_ctx = Context::from_parameters(input_video.parameters())
+        .whatever_context("video ctx")?;
+    let input_audio = input.streams().best(Type::Audio)
+        .whatever_context("No audio stream")?;
+    let audio_idx = input_audio.index();
+    let mut video_decoder = video_ctx
         .decoder()
         .video()
         .whatever_context("video decoder")?;
+    let audio_ctx = Context::from_parameters(input_audio.parameters()).whatever_context("audio ctx")?;
+    let mut audio_decoder = audio_ctx.decoder().audio().whatever_context("audio decoder")?;
 
     let mut scaler = scaling::context::Context::get(
-        decoder.format(),
-        decoder.width(),
-        decoder.height(),
+        video_decoder.format(),
+        video_decoder.width(),
+        video_decoder.height(),
         Pixel::BGRA,
-        decoder.width(),
-        decoder.height(),
+        video_decoder.width(),
+        video_decoder.height(),
         Flags::BILINEAR
     ).whatever_context("making scaler")?;
     let mut frame = frame::Video::empty();
     for (stream, packet) in input.packets() {
-        if stream.index() != video_idx {
-            continue;
-        }
-        decoder.send_packet(&packet).whatever_context("decoding")?;
-        loop {
-            match decoder.receive_frame(&mut frame) {
-                Ok(()) => {
-                    let mut rgb_frame = frame::Video::empty();
-                    scaler.run(&frame, &mut rgb_frame).whatever_context("conversion")?;
-                    let data = rgb_frame.data(0);
-                    unsafe {
-                        libdrc::drc_push_vid_frame(streamer, data.as_ptr(), data.len() as c_uint, decoder.width() as c_ushort, decoder.height() as c_ushort, drc_pixel_format_DRC_BGRA, drc_flipping_mode_DRC_NO_FLIP);
-                    };
-                    std::thread::sleep(Duration::from_micros((1000000.0 / 25.0) as u64));
+        if stream.index() == video_idx {
+            video_decoder.send_packet(&packet).whatever_context("decoding")?;
+            loop {
+                match video_decoder.receive_frame(&mut frame) {
+                    Ok(()) => {
+                        let mut rgb_frame = frame::Video::empty();
+                        scaler.run(&frame, &mut rgb_frame).whatever_context("conversion")?;
+                        let data = rgb_frame.data(0);
+                        unsafe {
+                            libdrc::drc_push_vid_frame(streamer, data.as_ptr(), data.len() as c_uint, video_decoder.width() as c_ushort, video_decoder.height() as c_ushort, drc_pixel_format_DRC_BGRA, drc_flipping_mode_DRC_NO_FLIP);
+                        };
+                        std::thread::sleep(Duration::from_micros((1000000.0 / 25.0) as u64));
+                    }
+                    Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => break,
+                    Err(e) => {
+                        return Err(e).whatever_context("uh oh");
+                    }
                 }
-                Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => break,
-                Err(e) => {
-                    return Err(e).whatever_context("uh oh");
+            }
+        } else if stream.index() == audio_idx {
+            audio_decoder.send_packet(&packet).whatever_context("decoding audio")?;
+            loop {
+                let mut frame = frame::Audio::empty();
+                match audio_decoder.receive_frame(&mut frame) {
+                    Ok(()) => {
+                        let data: Vec<i16> = frame.plane::<f32>(0).iter()
+                            .zip(frame.plane::<f32>(1))
+                            .flat_map(|(l, r)| [*l, *r])
+                            .map(|s| (s * (i16::MAX as f32)) as i16)
+                            .collect();
+                        unsafe {
+                            libdrc::drc_push_aud_frame(streamer, data.as_ptr(), data.len() as u32);
+                        }
+                    }
+                    Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => break,
+                    Err(e) => {
+                        return Err(e).whatever_context("uh oh");
+                    }
                 }
             }
         }
