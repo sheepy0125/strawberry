@@ -1,9 +1,8 @@
-use std::io::Write;
-use crate::video::data::Error::{ExtHeaderLength, ExtHeaderValue};
 use bitfld::layout;
-use snafu::{OptionExt, ResultExt, Snafu, Whatever, ensure};
-use zerocopy_derive::FromBytes;
-use zerocopy_derive::IntoBytes;
+use snafu::{ensure, OptionExt, Snafu};
+use std::io::Write;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 layout!({
     #[derive(IntoBytes, FromBytes)]

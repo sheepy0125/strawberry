@@ -311,6 +311,9 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
             std::thread::sleep(Duration::from_micros(
                 self.next_timestamp - current_timestamp,
             ));
+        } else if current_timestamp > self.next_timestamp + 50000 {
+            eprintln!("Behind by more than 50ms, pausing 100ms");
+            self.next_timestamp = current_timestamp + 100000;
         }
         self.next_timestamp += (1000000.0 / Self::FRAMERATE.freq()) as u64;
         Handle::current().block_on(self.send_packets(&audio, video.as_slice()))?;

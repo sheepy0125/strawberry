@@ -1,5 +1,4 @@
 use zerocopy::{big_endian, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
-use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::cmd::data::Payload;
 
 #[repr(C)]

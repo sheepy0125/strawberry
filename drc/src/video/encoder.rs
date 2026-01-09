@@ -13,7 +13,7 @@ const CHUNKS_PER_FRAME: i32 = 5;
 
 impl Encoder {
     pub fn new() -> Result<Self, Error> {
-        let mut builder = x264::Setup::preset(Preset::Slow, Tune::None, false, true);
+        let mut builder = x264::Setup::preset(Preset::Fast, Tune::None, false, true);
         unsafe {
             const ENABLE_INTRA_REFRESH: bool = true;
             let raw = builder.raw();

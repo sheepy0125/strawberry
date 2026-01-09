@@ -10,9 +10,7 @@
 // }
 
 use std::fmt::Debug;
-use zerocopy::{big_endian, little_endian, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
-use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
-use crate::cmd::generic::GenericCommandPacket;
+use zerocopy::{big_endian, little_endian, FromBytes, Immutable, IntoBytes, KnownLayout};
 
 #[repr(C)]
 #[derive(Debug, FromBytes, IntoBytes, KnownLayout, Immutable)]

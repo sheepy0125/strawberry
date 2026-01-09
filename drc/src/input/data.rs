@@ -1,7 +1,7 @@
-use bitfld::layout;
 use bitflags::bitflags;
+use bitfld::layout;
 use zerocopy::{big_endian, little_endian};
-use zerocopy_derive::{FromBytes, FromZeros};
+use zerocopy::FromBytes;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, FromBytes)]
