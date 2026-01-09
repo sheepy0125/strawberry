@@ -14,7 +14,7 @@ use std::io::Write;
 use std::process::Termination;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::runtime::Handle;
@@ -110,11 +110,13 @@ fn dump_frame(mut file: impl Write, chunks: &[&[u8]], is_idr: bool) {
 
 async fn msg_handler(resync: Arc<AtomicBool>) {
     let socket = UdpSocket::bind("192.168.1.10:50010").await.unwrap();
+    let mut counter = 1;
     loop {
         let mut buf = [0u8; 4];
         socket.recv(&mut buf).await.unwrap();
         if buf == [1, 0, 0, 0] {
-            eprintln!("resync");
+            eprintln!("resync {counter}");
+            counter += 1;
             resync.store(true, Ordering::Relaxed);
         } else {
             eprintln!("unexpected {buf:?}");
@@ -193,14 +195,16 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
         packet[4..8].copy_from_slice(&0x00100000u32.to_le_bytes()); // TODO: why LE?
         // Payload (24 bytes)
         packet[8..12].copy_from_slice(&(ts as u32).to_le_bytes()); // TODO: why LE?
-        packet[12..].copy_from_slice(&[
-            0x80, 0x3e, 0x00, 0x00, // mc_video[0]
-            0x80, 0x3e, 0x00, 0x00, // mc_video[1]
-            0x80, 0x3e, 0x00, 0x00, // mc_sync[0]
-            0x80, 0x3e, 0x00, 0x00, // mc_sync[1]
-            0x00, // vid_format
+        packet[28..].copy_from_slice(&[
+            0x01, // vid_format
             0x00, 0x00, 0x00, // padding
         ]);
+
+        // TODO: Figure out what these values do, and why these give better results than the ones used in libdrc
+        packet[12..16].copy_from_slice(&0u32.to_le_bytes()); // mc_video[0]
+        packet[16..20].copy_from_slice(&0u32.to_le_bytes()); // mc_video[1]
+        packet[20..24].copy_from_slice(&16000u32.to_le_bytes()); // mc_sync[0]
+        packet[24..28].copy_from_slice(&16000u32.to_le_bytes()); // mc_sync[1]
         packet
     }
 
@@ -212,7 +216,7 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
         Ok(())
     }
 
-    const FRAMERATE: FrameRate = FrameRate::Sixty;
+    const FRAMERATE: FrameRate = FrameRate::Fifty;
 
     fn prepare_packets(&mut self, timestamp: u64, resync: bool) -> Result<Vec<Vec<u8>>, Error> {
         let image = self.recv.borrow_and_update();
@@ -226,6 +230,9 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
             .encode(im.as_image(), resync || init_flag)
             .context(EncodingSnafu)?;
         debug_assert!(if resync || init_flag { idr } else { true });
+        if idr {
+            println!("idr");
+        }
         drop(image);
 
         let mut packets = Vec::new();
@@ -291,7 +298,7 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
     }
 
     fn update_frame(&mut self) -> Result<(), Error> {
-        let resync = self.resync.load(Ordering::Relaxed);
+        let resync = self.resync.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok();
 
         let video = self.prepare_packets(self.next_timestamp, resync)?;
         if video.is_empty() {
@@ -307,10 +314,6 @@ impl<T: Frame + Send + Sync + 'static> VideoRunner<T> {
         }
         self.next_timestamp += (1000000.0 / Self::FRAMERATE.freq()) as u64;
         Handle::current().block_on(self.send_packets(&audio, video.as_slice()))?;
-
-        if resync {
-            self.resync.store(false, Ordering::Relaxed);
-        }
 
         Ok(())
     }

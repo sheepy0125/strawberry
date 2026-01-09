@@ -1,10 +1,7 @@
 use snafu::{ResultExt, Snafu, ensure};
 use std::ffi::c_void;
 use x264::{Colorspace, Encoding, Image, Preset, Tune};
-use x264_sys::{
-    X264_ANALYSE_PSUB16x16, X264_CSP_I420, X264_KEYINT_MAX_INFINITE, X264_LOG_INFO, X264_RC_CQP,
-    x264_nal_t, x264_t,
-};
+use x264_sys::{X264_ANALYSE_PSUB16x16, X264_CSP_I420, X264_KEYINT_MAX_INFINITE, X264_LOG_INFO, X264_RC_CQP, x264_nal_t, x264_t, X264_ME_UMH, X264_B_ADAPT_TRELLIS, X264_DIRECT_PRED_AUTO};
 
 pub struct Encoder {
     encoder: x264::Encoder,
@@ -20,6 +17,23 @@ impl Encoder {
         unsafe {
             const ENABLE_INTRA_REFRESH: bool = true;
             let raw = builder.raw();
+
+            // Old slow preset
+            // raw.analyse.i_me_method = X264_ME_UMH as i32;
+            // raw.analyse.i_subpel_refine = 8;
+            // raw.i_frame_reference = 5;
+            // raw.i_bframe_adaptive = X264_B_ADAPT_TRELLIS as i32;
+            // raw.analyse.i_direct_mv_pred = X264_DIRECT_PRED_AUTO as i32;
+            // raw.rc.i_lookahead = 50;
+            //
+            // old zerolatency preset
+            // raw.rc.i_lookahead = 0;
+            // raw.i_sync_lookahead = 0;
+            // raw.i_bframe = 0;
+            // raw.b_sliced_threads = 1;
+            // raw.b_vfr_input = 0;
+            // raw.rc.b_mb_tree = 0;
+
             raw.analyse.inter &= !X264_ANALYSE_PSUB16x16;
             if ENABLE_INTRA_REFRESH {
                 raw.i_keyint_min = 10;
@@ -62,6 +76,10 @@ impl Encoder {
             raw.i_threads = 1;
             raw.b_sliced_threads = 0;
             raw.i_slice_count = 1;
+
+            raw.mastering_display.b_mastering_display = 0;
+            raw.content_light_level.b_cll = 0;
+            raw.i_alternative_transfer = 2;  // HUH?
 
             unsafe extern "C" fn process_nal_unit_trampoline(
                 _handle: *mut x264_t,
