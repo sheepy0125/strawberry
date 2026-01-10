@@ -1,7 +1,7 @@
 use snafu::{ResultExt, Snafu, ensure};
 use std::ffi::c_void;
 use x264::{Colorspace, Encoding, Image, Preset, Tune};
-use x264_sys::{X264_ANALYSE_PSUB16x16, X264_CSP_I420, X264_KEYINT_MAX_INFINITE, X264_LOG_INFO, X264_RC_CQP, x264_nal_t, x264_t, X264_ME_UMH, X264_B_ADAPT_TRELLIS, X264_DIRECT_PRED_AUTO};
+use x264_sys::{X264_ANALYSE_PSUB16x16, X264_CSP_I420, X264_KEYINT_MAX_INFINITE, X264_LOG_INFO, X264_RC_CQP, x264_nal_t, x264_t, X264_ME_UMH, X264_B_ADAPT_TRELLIS, X264_DIRECT_PRED_AUTO, X264_ANALYSE_PSUB8x8, X264_ANALYSE_I8x8, X264_RC_CRF, X264_RC_ABR};
 
 pub struct Encoder {
     encoder: x264::Encoder,
@@ -13,7 +13,7 @@ const CHUNKS_PER_FRAME: i32 = 5;
 
 impl Encoder {
     pub fn new() -> Result<Self, Error> {
-        let mut builder = x264::Setup::preset(Preset::Fast, Tune::None, false, true);
+        let mut builder = x264::Setup::preset(Preset::Medium, Tune::None, false, true);
         unsafe {
             const ENABLE_INTRA_REFRESH: bool = true;
             let raw = builder.raw();
@@ -43,7 +43,6 @@ impl Encoder {
                 raw.i_keyint_max = X264_KEYINT_MAX_INFINITE as i32;
             }
             raw.i_scenecut_threshold = -1;
-            // raw.i_csp = X264_CSP_I420 as i32;
             raw.b_cabac = 1;
             raw.b_interlaced = 0;
             raw.i_bframe = 0;
@@ -77,9 +76,7 @@ impl Encoder {
             raw.b_sliced_threads = 0;
             raw.i_slice_count = 1;
 
-            raw.mastering_display.b_mastering_display = 0;
-            raw.content_light_level.b_cll = 0;
-            raw.i_alternative_transfer = 2;  // HUH?
+            raw.i_level_idc = 10;
 
             unsafe extern "C" fn process_nal_unit_trampoline(
                 _handle: *mut x264_t,

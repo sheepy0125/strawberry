@@ -94,18 +94,7 @@ impl CommandHandler {
         seq_id: u16,
     ) -> Result<Arc<[u8]>, Error> {
         loop {
-            let mut retries = 0;
-            let packet = loop {
-                select! {
-                    res = rcv.recv() => break res.unwrap(),
-                    _ = tokio::time::sleep(Self::TIMEOUT) => {
-                        retries += 1;
-                        if retries >= Self::RETRIES {
-                            return Err(Error::Timeout)
-                        }
-                    },
-                }
-            };
+            let packet = rcv.recv().await.expect("broken channel");
             let packet_data =
                 CommandPacket::ref_from_bytes(&packet).map_err(|x| Error::Incomplete {
                     reason: x.to_string(),
@@ -125,15 +114,26 @@ impl CommandHandler {
         let seq_id = self.next_seq_id();
         let mut rcv = self.broadcast.subscribe();
 
-        self.send_packet(seq_id, data)
-            .await
-            .context(SendSnafu)?;
+        let mut retries = 0;
+        loop {
+            self.send_packet(seq_id, data)
+                .await
+                .context(SendSnafu)?;
 
-        let ack = self.recv_packet(&mut rcv, seq_id).await?;
-        let ack = CommandPacket::ref_from_bytes(&ack).expect("already unpacked");
+            let ack = select! {
+                res = self.recv_packet(&mut rcv, seq_id) => res?,
+                _ = tokio::time::sleep(Self::TIMEOUT) => {
+                    retries += 1;
+                    ensure!(retries < Self::RETRIES, TimeoutSnafu);
+                    continue;
+                }
+            };
+            let ack = CommandPacket::ref_from_bytes(&ack).expect("already unpacked");
 
-        ensure!(ack.header.packet_type == 1, AckExpectedSnafu);
-        ensure!(ack.payload.len() == 0, PayloadLengthSnafu);
+            ensure!(ack.header.packet_type == 1, AckExpectedSnafu);
+            ensure!(ack.payload.len() == 0, PayloadLengthSnafu);
+            break;
+        }
 
         let response = self.recv_packet(&mut rcv, seq_id).await?;
         let response = CommandPacket::ref_from_bytes(&response).expect("already unpacked");

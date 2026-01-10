@@ -10,7 +10,7 @@ use ffmpeg_next::{format, frame};
 use snafu::OptionExt;
 use snafu::{Report, ResultExt};
 use std::process::Termination;
-use std::time::Duration;
+use tokio::time::{Duration, Instant};
 use x264::{Colorspace, Image, Plane};
 
 struct MyFrame(frame::Video);
@@ -73,7 +73,8 @@ async fn main() -> Result<(), snafu::Whatever> {
     launch_uvc().await?;
 
     ffmpeg_next::init().whatever_context("init ffmpeg")?;
-    let mut input = input("/home/ruben/rick.mkv").whatever_context("load video")?;
+    let video = std::env::args().nth(1).expect("file passed as argument");
+    let mut input = input(&video).whatever_context("load video")?;
     let input_video = input
         .streams()
         .best(Type::Video)
@@ -91,6 +92,7 @@ async fn main() -> Result<(), snafu::Whatever> {
     let audio_ctx = Context::from_parameters(input_audio.parameters()).whatever_context("audio ctx")?;
     let mut audio_decoder = audio_ctx.decoder().audio().whatever_context("audio decoder")?;
     let streamer = Streamer::new().await.whatever_context("gamepad streamer")?;
+    let mut tick = Instant::now();
 
     for (stream, packet) in input.packets() {
         if stream.index() == video_idx {
@@ -102,7 +104,8 @@ async fn main() -> Result<(), snafu::Whatever> {
                         streamer
                             .push_frame(MyFrame(frame))
                             .whatever_context("streaming")?;
-                        tokio::time::sleep(Duration::from_millis(1000 / 25)).await;
+                        tick += Duration::from_millis(1000 / 25);
+                        tokio::time::sleep_until(tick).await;
                     }
                     Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => break,
                     Err(e) => {
