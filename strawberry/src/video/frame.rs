@@ -1,4 +1,4 @@
-use x264::{Colorspace, Image, Plane};
+use strawberry_x264::{Colorspace, Image, Plane};
 
 pub trait Frame {
     fn as_image(&self) -> Image<'_>;

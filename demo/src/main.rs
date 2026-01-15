@@ -1,7 +1,7 @@
-use drc::cmd::data::UvcUacPayload;
-use drc::cmd::{generic, CommandHandler};
-use drc::frame::Frame;
-use drc::Streamer;
+use strawberry::cmd::data::UvcUacPayload;
+use strawberry::cmd::{generic, CommandHandler};
+use strawberry::frame::Frame;
+use strawberry::Streamer;
 use ffmpeg_next::codec::Context;
 use ffmpeg_next::ffi::EAGAIN;
 use ffmpeg_next::format::input;
@@ -11,7 +11,7 @@ use snafu::OptionExt;
 use snafu::{Report, ResultExt};
 use std::process::Termination;
 use tokio::time::{Duration, Instant};
-use x264::{Colorspace, Image, Plane};
+use strawberry_x264::{Colorspace, Image, Plane};
 
 struct MyFrame(frame::Video);
 

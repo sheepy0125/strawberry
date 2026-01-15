@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["demo","drc", "drc-vnc", "libdrc", "x264"]
+members = ["demo", "strawberry", "drc-vnc", "libdrc", "strawberry-x264"]

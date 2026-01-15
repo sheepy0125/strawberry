@@ -1,14 +1,14 @@
-use drc::cmd::data::UvcUacPayload;
-use drc::cmd::{CommandHandler, generic};
-use drc::frame::Frame;
-use drc::{Streamer, StreamerError};
+use strawberry::cmd::data::UvcUacPayload;
+use strawberry::cmd::{CommandHandler, generic};
+use strawberry::frame::Frame;
+use strawberry::{Streamer, StreamerError};
 use image::{GenericImage, GenericImageView, ImageError, RgbaImage};
 use snafu::{OptionExt, Report, ResultExt, Snafu, Whatever, ensure};
 use std::process::Termination;
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::time::{Duration, Instant, Interval, MissedTickBehavior, interval, interval_at};
 use vnc::{PixelFormat, Rect, VncClient, VncConnector, VncError, VncEvent, X11Event};
-use x264::{Colorspace, Plane};
+use strawberry_x264::{Colorspace, Plane};
 use yuv::{
     YuvChromaSubsampling, YuvConversionMode, YuvError, YuvPlanarImageMut, YuvRange,
     YuvStandardMatrix, rgba_to_yuv420,
@@ -202,9 +202,9 @@ impl VncDrc {
 pub struct VncFrame(YuvPlanarImageMut<'static, u8>);
 
 impl Frame for VncFrame {
-    fn as_image(&self) -> x264::Image<'_> {
+    fn as_image(&self) -> strawberry_x264::Image<'_> {
         let VncFrame(frame) = self;
-        x264::Image::new(
+        strawberry_x264::Image::new(
             Colorspace::I420,
             frame.width as i32,
             frame.height as i32,
