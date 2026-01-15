@@ -1,6 +1,9 @@
 [package]
 name = "strawberry"
 description = "Sending video to a Wii U gamepad, made rusty"
+repository = "https://github.com/ActuallyRuben/strawberry.git"
+documentation = "https://docs.rs/strawberry"
+readme = "../README.md"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
