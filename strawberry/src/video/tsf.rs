@@ -1,24 +1,33 @@
+use pnet::{datalink::interfaces, ipnetwork::IpNetwork};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::net::Ipv4Addr;
+use std::str::FromStr;
 
-pub fn timestamp() -> u64 {
-    tsf()
-}
-
-fn tsf() -> u64 {
-    let mut buff = [0u8; 8];
-    File::open("/sys/class/net/wlp3s0/tsf").expect("opening TSF").read_exact(&mut buff).expect("reading TSF");
-    u64::from_ne_bytes(buff)
+fn get_interface_of_ipv4(addr: Ipv4Addr) -> Option<String> {
+    let ifa = pnet::datalink::interfaces().into_iter().find(|ifa| {
+        for ip in &ifa.ips {
+            if let IpNetwork::V4(ip) = ip
+                && ip.is_supernet_of(addr.into())
+            {
+                return true;
+            }
+        }
+        false
+    });
+    ifa.map(|ifa| ifa.name)
 }
 
 pub struct Tsf {
-    file: File
+    file: File,
 }
 
 impl Tsf {
     pub fn new() -> Self {
+        let iface = get_interface_of_ipv4(Ipv4Addr::from_str("192.168.1.10").unwrap())
+            .expect("no interface for 192.168.1.10");
         Self {
-            file: File::open("/sys/class/net/wlp3s0/tsf").expect("opening TSF"),
+            file: File::open(format!("/sys/class/net/{iface}/tsf")).expect("opening TSF"),
         }
     }
 
@@ -32,9 +41,9 @@ impl Tsf {
 
 #[cfg(test)]
 mod test {
+    use crate::video::tsf::*;
     use std::thread;
     use std::time::{Duration, Instant};
-    use crate::video::tsf::*;
 
     #[test]
     fn get_timestamp() {
